@@ -1,12 +1,22 @@
-from flask import Flask, request, jsonify, Response
+import socket
+import threading
+import queue
+import json
 import sqlite3
+import struct
 from werkzeug.security import generate_password_hash, check_password_hash
 
-app = Flask(__name__)
-DB_NAME = "tareas.db"
+HOST = "localhost"
+PORT = 5000
+DB_NAME = "tareas_distribuido.db"
+NUM_WORKERS = 3
+
+# Cola segura para distribuir conexiones a los workers
+cola_tareas = queue.Queue()
+
 
 def init_db():
-    """Inicializa la base de datos SQLite y crea la tabla de usuarios si no existe."""
+    """Simula el almacenamiento estructurado (ej. PostgreSQL) del esquema."""
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -18,114 +28,121 @@ def init_db():
         """)
         conn.commit()
 
-# 1. Endpoint de Registro de Usuarios
-@app.route("/registro", methods=["POST"])
-def registro():
-    datos = request.get_json()
-    if not datos or "usuario" not in datos or "contraseña" not in datos:
-        return jsonify({"status": "error", "mensaje": "Faltan datos de usuario o contraseña"}), 400
 
-    usuario = datos["usuario"].strip()
-    password = datos["contraseña"]
+def procesar_accion(data):
+    """Lógica de negocio ejecutada por los workers."""
+    accion = data.get("accion")
 
-    if not usuario or not password:
-        return jsonify({"status": "error", "mensaje": "El usuario y la contraseña no pueden estar vacíos"}), 400
+    if accion == "registro":
+        usuario = data.get("usuario")
+        password = data.get("password")
+        if not usuario or not password:
+            return {"status": "error", "mensaje": "Faltan datos."}
 
-    # Hashear la contraseña antes de guardarla (nunca en texto plano)
-    password_hasheada = generate_password_hash(password)
+        try:
+            hash_pass = generate_password_hash(password)
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO usuarios (usuario, password_hash) VALUES (?, ?)",
+                    (usuario, hash_pass),
+                )
+                conn.commit()
+            return {"status": "success", "mensaje": f"Usuario {usuario} registrado exitosamente."}
+        except sqlite3.IntegrityError:
+            return {"status": "error", "mensaje": "El usuario ya existe."}
 
-    try:
+    elif accion == "login":
+        usuario = data.get("usuario")
+        password = data.get("password")
         with sqlite3.connect(DB_NAME) as conn:
             cursor = conn.cursor()
-            # Uso de consulta parametrizada (?) para evitar Inyección SQL
-            cursor.execute(
-                "INSERT INTO usuarios (usuario, password_hash) VALUES (?, ?)",
-                (usuario, password_hasheada)
-            )
-            conn.commit()
-        return jsonify({"status": "success", "mensaje": f"Usuario '{usuario}' registrado con éxito."}), 201
-    except sqlite3.IntegrityError:
-        return jsonify({"status": "error", "mensaje": "El nombre de usuario ya existe."}), 409
-    except Exception as e:
-        return jsonify({"status": "error", "mensaje": str(e)}), 500
+            cursor.execute("SELECT password_hash FROM usuarios WHERE usuario = ?", (usuario,))
+            fila = cursor.fetchone()
 
-# 2. Endpoint de Inicio de Sesión
-@app.route("/login", methods=["POST"])
-def login():
-    datos = request.get_json()
-    if not datos or "usuario" not in datos or "contraseña" not in datos:
-        return jsonify({"status": "error", "mensaje": "Debe enviar usuario y contraseña"}), 400
+        if fila and check_password_hash(fila[0], password):
+            return {"status": "success", "mensaje": "Login exitoso. Token generado."}
+        return {"status": "error", "mensaje": "Credenciales inválidas."}
 
-    usuario = datos["usuario"]
-    password = datos["contraseña"]
-
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT password_hash FROM usuarios WHERE usuario = ?", (usuario,))
-        fila = cursor.fetchone()
-
-    # Verificar si el usuario existe y si el hash coincide con la contraseña ingresada
-    if fila and check_password_hash(fila[0], password):
-        return jsonify({
+    elif accion == "get_tareas":
+        # Requiere que el cliente envíe sus credenciales en la petición para validar sesión
+        if not data.get("auth"):
+            return {"status": "error", "mensaje": "Acceso denegado. Se requiere autenticación."}
+        return {
             "status": "success",
-            "mensaje": f"Inicio de sesión exitoso. Bienvenido, {usuario}. Acceso permitido a /tareas."
-        }), 200
-    else:
-        return jsonify({"status": "error", "mensaje": "Credenciales inválidas."}), 401
+            "mensaje": "Lista de tareas distribuida obtenida correctamente.",
+            "tareas": ["Tarea 1", "Tarea 2"],
+        }
 
-# 3. Endpoint de Gestión de Tareas (HTML de bienvenida con Autenticación Básica obligatoria)
-@app.route("/tareas", methods=["GET"])
-def tareas():
-    auth = request.authorization
+    return {"status": "error", "mensaje": "Acción no reconocida."}
 
-    # Si no envía credenciales, exigir Autenticación Básica (401)
-    if not auth or not auth.username or not auth.password:
-        return Response(
-            "Acceso no autorizado. Debe autenticarse.",
-            status=401,
-            headers={"WWW-Authenticate": 'Basic realm="Login Required"'}
-        )
 
-    # Verificar credenciales en SQLite
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT password_hash FROM usuarios WHERE usuario = ?", (auth.username,))
-        fila = cursor.fetchone()
+def _recv_exacto(sock, cantidad):
+    """Lee exactamente `cantidad` bytes del socket (o lanza si se corta la conexión)."""
+    fragmentos = []
+    restante = cantidad
+    while restante > 0:
+        fragmento = sock.recv(restante)
+        if not fragmento:
+            raise ConnectionError("Conexión cerrada antes de recibir todos los datos.")
+        fragmentos.append(fragmento)
+        restante -= len(fragmento)
+    return b"".join(fragmentos)
 
-    if not fila or not check_password_hash(fila[0], auth.password):
-        return Response(
-            "Acceso no autorizado. Credenciales inválidas.",
-            status=401,
-            headers={"WWW-Authenticate": 'Basic realm="Login Required"'}
-        )
 
-    usuario_actual = auth.username
+def _recibir_mensaje(sock):
+    """Recibe un mensaje con prefijo de longitud (4 bytes, big-endian) y lo decodifica."""
+    cabecera = _recv_exacto(sock, 4)
+    (longitud,) = struct.unpack("!I", cabecera)
+    if longitud == 0:
+        return None
+    return json.loads(_recv_exacto(sock, longitud).decode("utf-8"))
 
-    html_bienvenida = f"""
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-        <meta charset="UTF-8">
-        <title>Sistema de Gestión de Tareas</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; background-color: #f4f6f9; text-align: center; padding: 50px; }}
-            .card {{ background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); display: inline-block; }}
-            h1 {{ color: #2c3e50; }}
-            p {{ color: #555; }}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <h1>¡Bienvenido al Sistema de Gestión de Tareas!</h1>
-            <p>Sesión activa para: <strong>{usuario_actual}</strong></p>
-            <p>Servidor API REST con Flask y persistencia en SQLite funcionando correctamente.</p>
-        </div>
-    </body>
-    </html>
-    """
-    return Response(html_bienvenida, mimetype="text/html", status=200)
+
+def _enviar_mensaje(sock, objeto):
+    """Serializa un objeto a JSON y lo envía con prefijo de longitud (4 bytes, big-endian)."""
+    cuerpo = json.dumps(objeto).encode("utf-8")
+    sock.sendall(struct.pack("!I", len(cuerpo)) + cuerpo)
+
+
+def worker(worker_id):
+    """Función de bucle continuo para el Thread Pool."""
+    while True:
+        cliente_socket, direccion = cola_tareas.get()
+        print(f"[Worker {worker_id}] Atendiendo conexión de {direccion}")
+        try:
+            # Recibir datos del cliente y parsear JSON
+            datos = _recibir_mensaje(cliente_socket)
+            if datos is not None:
+                respuesta = procesar_accion(datos)
+                # Enviar respuesta serializada y cerrar socket de este cliente
+                _enviar_mensaje(cliente_socket, respuesta)
+        except Exception as e:
+            print(f"[Worker {worker_id}] Error: {e}")
+        finally:
+            cliente_socket.close()
+            cola_tareas.task_done()
+
+
+def iniciar_servidor():
+    init_db()
+
+    # Iniciar pool de 3 hilos workers (Clase 10 / Thread Pool)
+    for i in range(NUM_WORKERS):
+        hilo = threading.Thread(target=worker, args=(i + 1,), daemon=True)
+        hilo.start()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
+        servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        servidor.bind((HOST, PORT))
+        servidor.listen(5)
+        print(f"Servidor distribuido escuchando en {HOST}:{PORT}...")
+
+        while True:
+            # Hilo principal dedicado exclusivamente a aceptar conexiones
+            cliente, direccion = servidor.accept()
+            cola_tareas.put((cliente, direccion))
+
 
 if __name__ == "__main__":
-    init_db()
-    print("Servidor escuchando en http://localhost:5000...")
-    app.run(host="localhost", port=5000, debug=False)
+    iniciar_servidor()

@@ -1,70 +1,81 @@
-import requests
+import socket
+import json
+import struct
 
-BASE_URL = "http://localhost:5000"
-sesion_creada = None  # Guardará (usuario, contraseña) tras iniciar sesión
+HOST = "localhost"
+PORT = 5000
 
-def registrar_usuario():
-    usuario = input("Ingrese nombre de usuario: ")
-    password = input("Ingrese contraseña: ")
-    payload = {"usuario": usuario, "contraseña": password}
-    
-    response = requests.post(f"{BASE_URL}/registro", json=payload)
-    datos = response.json()
-    print(f"[{response.status_code}] {datos.get('mensaje')}")
 
-def iniciar_sesion():
-    global sesion_creada
-    usuario = input("Usuario: ")
-    password = input("Contraseña: ")
-    payload = {"usuario": usuario, "contraseña": password}
-    
-    response = requests.post(f"{BASE_URL}/login", json=payload)
-    datos = response.json()
-    print(f"[{response.status_code}] {datos.get('mensaje')}")
-    
-    if response.status_code == 200:
-        sesion_creada = (usuario, password)
+def _recv_exacto(sock, cantidad):
+    """Lee exactamente `cantidad` bytes del socket (o lanza si se corta la conexión)."""
+    fragmentos = []
+    restante = cantidad
+    while restante > 0:
+        fragmento = sock.recv(restante)
+        if not fragmento:
+            raise ConnectionError("El servidor cerró la conexión inesperadamente.")
+        fragmentos.append(fragmento)
+        restante -= len(fragmento)
+    return b"".join(fragmentos)
 
-def ver_tareas():
-    if not sesion_creada:
-        print("Aviso: Primero debes iniciar sesión (Opción 2) para acceder a tus tareas.")
-        return
 
-    # Se envían las credenciales mediante HTTP Basic Auth al endpoint GET /tareas
-    response = requests.get(f"{BASE_URL}/tareas", auth=sesion_creada)
-    if response.status_code == 200:
-        print("\n--- Respuesta HTML del Servidor (GET /tareas) ---")
-        print(response.text)
-        print("-------------------------------------------------")
-    else:
-        print(f"Error [{response.status_code}]: {response.text}")
+def enviar_peticion(datos):
+    """Abre un socket, envía la petición JSON, espera la respuesta y cierra."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as cliente:
+        try:
+            cliente.connect((HOST, PORT))
+            cuerpo = json.dumps(datos).encode("utf-8")
+            # Prefijo de longitud (4 bytes, big-endian) para delimitar el mensaje
+            cliente.sendall(struct.pack("!I", len(cuerpo)) + cuerpo)
+
+            (longitud,) = struct.unpack("!I", _recv_exacto(cliente, 4))
+            respuesta = _recv_exacto(cliente, longitud).decode("utf-8")
+            return json.loads(respuesta)
+        except ConnectionRefusedError:
+            return {"status": "error", "mensaje": "El servidor distribuido está fuera de línea."}
+        except (ConnectionError, OSError):
+            return {"status": "error", "mensaje": "Se perdió la conexión con el servidor distribuido."}
+
 
 def main():
+    sesion_activa = False
+
     while True:
-        print("\n=== SISTEMA DE GESTIÓN DE TAREAS ===")
-        print("1. Registrar usuario (POST /registro)")
-        print("2. Iniciar sesión (POST /login)")
-        print("3. Ver tareas / HTML de bienvenida (GET /tareas)")
+        print("\n--- GESTOR DE TAREAS DISTRIBUIDO ---")
+        print("1. Registrar Usuario")
+        print("2. Iniciar Sesión")
+        print("3. Ver Tareas")
         print("4. Salir")
-        
+
         opcion = input("Seleccione una opción: ")
-        
-        try:
-            if opcion == "1":
-                registrar_usuario()
-            elif opcion == "2":
-                iniciar_sesion()
-            elif opcion == "3":
-                ver_tareas()
-            elif opcion == "4":
-                print("Saliendo del cliente...")
-                break
+
+        if opcion == "1":
+            usr = input("Nuevo usuario: ")
+            pwd = input("Contraseña: ")
+            res = enviar_peticion({"accion": "registro", "usuario": usr, "password": pwd})
+            print(f"> {res['mensaje']}")
+
+        elif opcion == "2":
+            usr = input("Usuario: ")
+            pwd = input("Contraseña: ")
+            res = enviar_peticion({"accion": "login", "usuario": usr, "password": pwd})
+            print(f"> {res['mensaje']}")
+            if res["status"] == "success":
+                sesion_activa = True
+
+        elif opcion == "3":
+            if not sesion_activa:
+                print("> Error: Debe iniciar sesión primero.")
             else:
-                print("Opción no válida.")
-        except requests.exceptions.ConnectionError:
-            print("Error: No se pudo conectar al servidor. Asegúrate de ejecutar 'python servidor.py' primero.")
-        except Exception as e:
-            print(f"Ocurrió un error inesperado: {e}")
+                res = enviar_peticion({"accion": "get_tareas", "auth": True})
+                print(f"> Respuesta del sistema: {res.get('tareas', res['mensaje'])}")
+
+        elif opcion == "4":
+            print("Saliendo del sistema...")
+            break
+        else:
+            print("Opción inválida.")
+
 
 if __name__ == "__main__":
     main()
